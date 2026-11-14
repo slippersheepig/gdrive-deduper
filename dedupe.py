@@ -128,7 +128,7 @@ def scan_recursive_folders(service, root_folder_ids: list[str]) -> list[dict]:
             list_kwargs = {
                 "q": query,
                 "spaces": "drive",
-                "fields": "nextPageToken, files(id, name, mimeType, md5Checksum, size, createdTime, videoMediaMetadata)",
+                "fields": "nextPageToken, files(id, name, mimeType, md5Checksum, size, createdTime, videoMediaMetadata, imageMediaMetadata)",
                 "pageSize": 1000,
                 "pageToken": page_token,
                 "supportsAllDrives": True,
@@ -163,7 +163,7 @@ def scan_full_drive(service) -> list[dict]:
         list_kwargs = {
             "q": TARGET_MIME_QUERY,
             "spaces": "drive",
-            "fields": "nextPageToken, files(id, name, mimeType, md5Checksum, size, createdTime, videoMediaMetadata)",
+            "fields": "nextPageToken, files(id, name, mimeType, md5Checksum, size, createdTime, videoMediaMetadata, imageMediaMetadata)",
             "pageSize": 1000,
             "pageToken": page_token,
             "supportsAllDrives": True,
@@ -219,10 +219,11 @@ def run_dedupe():
     if skipped_count > 0:
         logging.info(f"已跳过 {skipped_count} 个 0 字节空文件。")
 
-    # 双轨去重聚类（MD5 精确哈希匹配 + 视频严格元数据指纹匹配）
+    # 多维去重聚类（MD5 精确匹配 + 视频元数据指纹 + 图片元数据指纹）
     dsu = DisjointSet(len(valid_files))
     md5_map = defaultdict(list)
     vmeta_map = defaultdict(list)
+    imeta_map = defaultdict(list)
 
     for idx, f in enumerate(valid_files):
         size = int(f.get("size", 0))
@@ -243,6 +244,18 @@ def run_dedupe():
             except (ValueError, TypeError):
                 pass
 
+        # 图片特征指纹：当且仅当文件大小（精确到字节）、分辨率全部一致且有效时聚类
+        imd = f.get("imageMediaMetadata")
+        if imd:
+            try:
+                w = int(imd.get("width", 0))
+                h = int(imd.get("height", 0))
+                if w > 0 and h > 0:
+                    ikey = (size, w, h)
+                    imeta_map[ikey].append(idx)
+            except (ValueError, TypeError):
+                pass
+
     # 1. 合并 MD5 相同的组
     for indices in md5_map.values():
         for i in range(1, len(indices)):
@@ -253,11 +266,18 @@ def run_dedupe():
         for i in range(1, len(indices)):
             dsu.union(indices[0], indices[i])
 
+    # 3. 合并图片元数据完全一致的组（即使 MD5 不同或缺失）
+    for indices in imeta_map.values():
+        for i in range(1, len(indices)):
+            dsu.union(indices[0], indices[i])
+
     # 聚类成最终重复组
     cluster_groups = defaultdict(list)
     for idx, f in enumerate(valid_files):
         md5 = f.get("md5Checksum")
         vmd = f.get("videoMediaMetadata")
+        imd = f.get("imageMediaMetadata")
+
         has_vmeta = False
         if vmd:
             try:
@@ -269,8 +289,15 @@ def run_dedupe():
             except (ValueError, TypeError):
                 pass
 
-        # 仅当文件具有 MD5 或具有有效视频元数据时才纳入聚合
-        if not md5 and not has_vmeta:
+        has_imeta = False
+        if imd:
+            try:
+                has_imeta = int(imd.get("width", 0)) > 0 and int(imd.get("height", 0)) > 0
+            except (ValueError, TypeError):
+                pass
+
+        # 仅当文件具有 MD5 或具有有效媒体元数据（视频/图片）时才纳入聚合
+        if not md5 and not has_vmeta and not has_imeta:
             continue
 
         root = dsu.find(idx)
@@ -285,6 +312,7 @@ def run_dedupe():
     category_stats = defaultdict(int)
     md5_match_count = 0
     vmeta_match_count = 0
+    imeta_match_count = 0
 
     for root_id, flist in duplicate_groups.items():
         # 保留创建时间最早的一份
@@ -296,17 +324,29 @@ def run_dedupe():
         md5_set = {x.get("md5Checksum") for x in flist if x.get("md5Checksum")}
         is_pure_md5 = (len(md5_set) == 1 and len(flist) == sum(1 for x in flist if x.get("md5Checksum")))
 
+        keeper_size_mb = round(int(keeper.get("size", 0)) / 1024 / 1024, 2)
         if is_pure_md5:
             md5_match_count += 1
             reason_str = "MD5 精确匹配"
         else:
-            vmeta_match_count += 1
-            vmd = next((x.get("videoMediaMetadata") for x in flist if x.get("videoMediaMetadata")), {})
-            dur_sec = round(int(vmd.get("durationMillis", 0)) / 1000, 2)
-            reason_str = (
-                f"视频严格元数据匹配 (大小: {round(int(keeper.get('size', 0)) / 1024 / 1024, 2)} MB, "
-                f"分辨率: {vmd.get('width')}x{vmd.get('height')}, 时长: {dur_sec}s)"
-            )
+            vmd = next((x.get("videoMediaMetadata") for x in flist if x.get("videoMediaMetadata")), None)
+            imd = next((x.get("imageMediaMetadata") for x in flist if x.get("imageMediaMetadata")), None)
+
+            if vmd:
+                vmeta_match_count += 1
+                dur_sec = round(int(vmd.get("durationMillis", 0)) / 1000, 2)
+                reason_str = (
+                    f"视频严格元数据匹配 (大小: {keeper_size_mb} MB, "
+                    f"分辨率: {vmd.get('width')}x{vmd.get('height')}, 时长: {dur_sec}s)"
+                )
+            elif imd:
+                imeta_match_count += 1
+                reason_str = (
+                    f"图片严格元数据匹配 (大小: {keeper_size_mb} MB, "
+                    f"分辨率: {imd.get('width')}x{imd.get('height')})"
+                )
+            else:
+                reason_str = "元数据匹配"
 
         logging.info(f"保留原件 [{reason_str}]: {keeper['name']} (ID: {keeper['id']})")
         for item in to_trash:
@@ -333,11 +373,18 @@ def run_dedupe():
     reclaimed_gb = round(reclaimed_bytes / (1024 ** 3), 2)
     cat_summary = ", ".join([f"{k}: {v}个" for k, v in category_stats.items()]) if category_stats else "无"
 
+    match_parts = [f"MD5: {md5_match_count}组"]
+    if vmeta_match_count > 0:
+        match_parts.append(f"视频元数据: {vmeta_match_count}组")
+    if imeta_match_count > 0:
+        match_parts.append(f"图片元数据: {imeta_match_count}组")
+    match_summary = ", ".join(match_parts)
+
     summary_text = (
         f"📊 *Google Drive 自动去重报告*\n"
         f"- 扫描范围: `{target_desc}`\n"
         f"- 扫描文件总数: `{len(all_files)}`\n"
-        f"- 发现重复组数: `{len(duplicate_groups)}` (MD5匹配: {md5_match_count}组, 视频元数据匹配: {vmeta_match_count}组)\n"
+        f"- 发现重复组数: `{len(duplicate_groups)}` ({match_summary})\n"
         f"- {'预估清理' if DRY_RUN else '已移入回收站'}: `{trashed_count}` 个文件\n"
         f"- 类型分布: `{cat_summary}`\n"
         f"- 释放空间: `{reclaimed_gb} GB`\n"
